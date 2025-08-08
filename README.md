@@ -1,6 +1,12 @@
-# Imagewag Image Display App
+# ImageWag Image Display App
 
-TBD
+Loads all PNG images from root SD card.
+
+PNG images should be less than 1.5MB
+
+Use left & right arrow keys to navigate through images.
+Use R key for random image.
+Use F key to flip image upside down for badge mode.
 
 ## License
 
