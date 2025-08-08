@@ -6,6 +6,8 @@ idf_component_register(
 		fatfs
 		nvs_flash
 		badge-bsp
+		sdmmc
+		driver
 	INCLUDE_DIRS
 		"."
 )
