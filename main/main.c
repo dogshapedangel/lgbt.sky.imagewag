@@ -3,6 +3,8 @@
 #include <string.h>
 #include <dirent.h>
 #include <time.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "bsp/device.h"
 #include "bsp/display.h"
 #include "bsp/input.h"
@@ -37,6 +39,14 @@ static size_t                       display_v_res        = 0;
 static lcd_color_rgb_pixel_format_t display_color_format;
 static QueueHandle_t                input_event_queue = NULL;
 
+// Image navigation variables
+static char png_files[MAX_PNG_FILES][MAX_PATH_LENGTH];
+static int png_count = 0;
+static int current_image_index = 0;
+static bool sd_card_available = false;
+static lv_obj_t* current_image = NULL;
+static bool image_flipped = false;
+
 // Function to check if a filename ends with .png
 bool is_png_file(const char* filename) {
     size_t len = strlen(filename);
@@ -44,16 +54,15 @@ bool is_png_file(const char* filename) {
     return (strcasecmp(filename + len - 4, ".png") == 0);
 }
 
-// Function to scan directory for PNG files and return a random one
-char* get_random_png_file(void) {
+// Function to scan directory for PNG files and populate the global list
+int scan_png_files(void) {
     DIR* dir = opendir(SD_MOUNT_POINT);
     if (dir == NULL) {
         ESP_LOGE(TAG, "Failed to open directory %s", SD_MOUNT_POINT);
-        return NULL;
+        return 0;
     }
 
-    static char png_files[MAX_PNG_FILES][MAX_PATH_LENGTH];
-    int png_count = 0;
+    png_count = 0;
     int total_files = 0;
     struct dirent* entry;
 
@@ -94,18 +103,180 @@ char* get_random_png_file(void) {
         } else {
             ESP_LOGW(TAG, "No PNG files found in %s (found %d other files)", SD_MOUNT_POINT, total_files);
         }
-        return NULL;
     }
 
-    // Select a random PNG file
+    return png_count;
+}
+
+// Function to load and display an image
+void load_image(int index) {
+    if (!sd_card_available) {
+        ESP_LOGE(TAG, "SD card not available");
+        return;
+    }
+    
+    if (png_count == 0) {
+        ESP_LOGE(TAG, "No PNG files available");
+        return;
+    }
+    
+    if (index < 0 || index >= png_count) {
+        ESP_LOGE(TAG, "Invalid image index: %d (total: %d)", index, png_count);
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Loading image %d: %s", index, png_files[index]);
+    
+    lvgl_lock();
+    
+    // Clear existing image if it exists
+    if (current_image != NULL) {
+        ESP_LOGI(TAG, "Deleting previous image");
+        lv_obj_delete(current_image);
+        current_image = NULL;
+    }
+    
+    // Create new image widget
+    lv_obj_t* screen = lv_screen_active();
+    if (screen == NULL) {
+        ESP_LOGE(TAG, "Failed to get active screen");
+        lvgl_unlock();
+        return;
+    }
+    
+    current_image = lv_image_create(screen);
+    if (current_image == NULL) {
+        ESP_LOGE(TAG, "Failed to create image widget");
+        lvgl_unlock();
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Created image widget, setting source...");
+    
+    // Set the image source
+    lv_image_set_src(current_image, png_files[index]);
+    
+    // Set full size
+    lv_obj_set_size(current_image, 800, 480);
+    
+    // Center the image
+    lv_obj_align(current_image, LV_ALIGN_CENTER, 0, 0);
+    
+    // Make sure the image is visible
+    lv_obj_set_style_bg_opa(current_image, LV_OPA_TRANSP, LV_PART_MAIN);
+    
+    // Apply flip if needed
+    if (image_flipped) {
+        lv_image_set_rotation(current_image, 1800); // 180 degrees = 1800 tenths of degrees
+        ESP_LOGI(TAG, "Applied flip rotation");
+    }
+    
+    current_image_index = index;
+    
+    lvgl_unlock();
+    
+    ESP_LOGI(TAG, "Image loaded successfully: %s", png_files[index]);
+}
+
+// Function to go to next image
+void next_image(void) {
+    if (png_count == 0) return;
+    
+    int next_index = (current_image_index + 1) % png_count;
+    load_image(next_index);
+    ESP_LOGI(TAG, "Switched to next image: %d/%d", next_index + 1, png_count);
+}
+
+// Function to go to previous image
+void previous_image(void) {
+    if (png_count == 0) return;
+    
+    int prev_index = (current_image_index - 1 + png_count) % png_count;
+    load_image(prev_index);
+    ESP_LOGI(TAG, "Switched to previous image: %d/%d", prev_index + 1, png_count);
+}
+
+// Function to go to random image
+void random_image(void) {
+    if (png_count == 0) return;
+    
     srand(time(NULL));
     int random_index = rand() % png_count;
-    ESP_LOGI(TAG, "Selected random PNG file: %s", png_files[random_index]);
+    load_image(random_index);
+    ESP_LOGI(TAG, "Switched to random image: %d/%d", random_index + 1, png_count);
+}
+
+// Function to flip image upside down
+void flip_image(void) {
+    if (current_image == NULL) return;
     
-    // Return a pointer to the selected filename
-    static char selected_file[MAX_PATH_LENGTH];
-    strcpy(selected_file, png_files[random_index]);
-    return selected_file;
+    lvgl_lock();
+    
+    image_flipped = !image_flipped;
+    
+    if (image_flipped) {
+        lv_image_set_rotation(current_image, 1800); // 180 degrees
+        ESP_LOGI(TAG, "Image flipped upside down");
+    } else {
+        lv_image_set_rotation(current_image, 0); // 0 degrees
+        ESP_LOGI(TAG, "Image flipped back to normal");
+    }
+    
+    lvgl_unlock();
+}
+
+// Function to handle input events
+void handle_input_event(bsp_input_event_t* event) {
+    ESP_LOGI(TAG, "Input event received: type=%d", event->type);
+    
+    switch (event->type) {
+        case INPUT_EVENT_TYPE_NAVIGATION:
+            ESP_LOGI(TAG, "Navigation event: key=%d, state=%d", event->args_navigation.key, event->args_navigation.state);
+            if (event->args_navigation.state) { // Key press (not release)
+                switch (event->args_navigation.key) {
+                    case BSP_INPUT_NAVIGATION_KEY_LEFT:
+                        ESP_LOGI(TAG, "Left arrow pressed");
+                        previous_image();
+                        break;
+                    case BSP_INPUT_NAVIGATION_KEY_RIGHT:
+                        ESP_LOGI(TAG, "Right arrow pressed");
+                        next_image();
+                        break;
+                    default:
+                        ESP_LOGI(TAG, "Other navigation key: %d", event->args_navigation.key);
+                        break;
+                }
+            }
+            break;
+            
+        case INPUT_EVENT_TYPE_KEYBOARD:
+            ESP_LOGI(TAG, "Keyboard event: ascii='%c' (0x%02x)", event->args_keyboard.ascii, event->args_keyboard.ascii);
+            // Handle ASCII keyboard input
+            if (event->args_keyboard.ascii == 'r' || event->args_keyboard.ascii == 'R') {
+                ESP_LOGI(TAG, "R key pressed - random image");
+                random_image();
+            } else if (event->args_keyboard.ascii == 'f' || event->args_keyboard.ascii == 'F') {
+                ESP_LOGI(TAG, "F key pressed - flip image");
+                flip_image();
+            }
+            break;
+            
+        case INPUT_EVENT_TYPE_SCANCODE:
+            ESP_LOGI(TAG, "Scancode event: scancode=0x%04x", event->args_scancode.scancode);
+            // Handle scancode input for R and F keys
+            if (event->args_scancode.scancode == BSP_INPUT_SCANCODE_R) {
+                ESP_LOGI(TAG, "R scancode - random image");
+                random_image();
+            } else if (event->args_scancode.scancode == BSP_INPUT_SCANCODE_F) {
+                ESP_LOGI(TAG, "F scancode - flip image");
+                flip_image();
+            }
+            break;
+            
+        default:
+            ESP_LOGI(TAG, "Unknown input event type: %d", event->type);
+            break;
+    }
 }
 
 void app_main(void) {
@@ -158,7 +329,7 @@ void app_main(void) {
     };
     
     esp_err_t sd_ret = esp_vfs_fat_sdmmc_mount(mount_point, &host, &slot_config, &mount_config, &card);
-    bool sd_card_available = false;
+    sd_card_available = false;
     
     if (sd_ret != ESP_OK) {
         ESP_LOGW(TAG, "SDMMC mount failed (%s), trying SPI mode...", esp_err_to_name(sd_ret));
@@ -222,12 +393,13 @@ void app_main(void) {
 
     ESP_LOGW(TAG, "Hello world!");
 
-    // Get a random PNG file from SD card only if SD card is available
-    char* random_png = NULL;
+    // Scan for PNG files on SD card if available
     if (sd_card_available) {
-        random_png = get_random_png_file();
+        ESP_LOGI(TAG, "SD card is available, scanning for PNG files...");
+        int found_files = scan_png_files();
+        ESP_LOGI(TAG, "Found %d PNG files", found_files);
     } else {
-        ESP_LOGW(TAG, "SD card not available, skipping PNG file selection");
+        ESP_LOGW(TAG, "SD card not available, skipping PNG file scanning");
     }
 
     lvgl_lock();
@@ -238,24 +410,14 @@ void app_main(void) {
     lv_obj_set_style_bg_color(screen, lv_color_hex(0x8B00FF), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
     
-    // Remove flex layout to allow proper manual positioning of the image
-
-    if (random_png != NULL) {
-        ESP_LOGI(TAG, "Attempting to display image: %s", random_png);
+    if (png_count > 0) {
+        ESP_LOGI(TAG, "PNG files found, attempting to load first image...");
+        lvgl_unlock(); // Unlock before calling load_image which has its own lock
         
-        // Create and display the image - remove test rectangle since images work
-        lv_obj_t* img = lv_image_create(screen);
-        
-        // Set the image source first
-        lv_image_set_src(img, random_png);
-        
-        // Use full size now that cache is increased to 2MB
-        lv_obj_set_size(img, 800, 480);
-        
-        ESP_LOGI(TAG, "Image widget created and source set: %s", random_png);
-        
-        // Center the image perfectly on screen
-        lv_obj_align(img, LV_ALIGN_CENTER, 0, 0);
+        // Load the first image
+        current_image_index = 0;
+        load_image(current_image_index);
+        ESP_LOGI(TAG, "Attempted to load first image: %d/%d", current_image_index + 1, png_count);
     } else {
         // Fallback: show a label if no PNG files found or SD card not available
         lv_obj_t* label = lv_label_create(screen);
@@ -268,7 +430,23 @@ void app_main(void) {
             lv_label_set_text(label, "No PNG files found\nCheck console for\nfile listing");
             ESP_LOGW(TAG, "No PNG files found, showing fallback message. Check logs for file listing.");
         }
+        lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
+        
+        lvgl_unlock();
     }
 
-    lvgl_unlock();    // You can add your main loop here
+    ESP_LOGI(TAG, "Starting main event loop");
+    ESP_LOGI(TAG, "Controls: Left/Right arrows = navigate, R = random image, F = flip image");
+
+    // Main event loop
+    bsp_input_event_t input_event;
+    while (true) {
+        // Check for input events with a timeout
+        if (xQueueReceive(input_event_queue, &input_event, pdMS_TO_TICKS(100)) == pdTRUE) {
+            handle_input_event(&input_event);
+        }
+        
+        // Small delay to prevent excessive CPU usage
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
 }
