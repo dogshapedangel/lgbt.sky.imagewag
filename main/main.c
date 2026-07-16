@@ -52,6 +52,13 @@ static bool image_flipped        = false;
 static bool       menu_visible    = false;
 static TickType_t menu_shown_tick = 0;
 
+// Slideshow timer: T cycles through static (off) and preset advance intervals
+static const uint32_t slideshow_intervals_ms[] = {0, 15000, 30000, 60000, 300000, 600000};
+static const char*    slideshow_labels[]       = {"Static", "15s", "30s", "1m", "5m", "10m"};
+#define SLIDESHOW_MODE_COUNT (sizeof(slideshow_intervals_ms) / sizeof(slideshow_intervals_ms[0]))
+static int        slideshow_mode      = 0;
+static TickType_t slideshow_last_tick = 0;
+
 // Function to check if a filename ends with .png
 static bool is_png_file(const char* filename) {
     size_t len = strlen(filename);
@@ -173,16 +180,59 @@ static void draw_message(const char* line1, const char* line2, const char* line3
     }
 }
 
+// Menu bar styling: launcher footer layout (metrics from the launcher's
+// common/theme.c) with a semi-transparent dark bar and white text
+#define FOOTER_COLOR_BG        0xE0101010  // bar background (semi-transparent)
+#define FOOTER_COLOR_FG        0xFFFFFFFF  // text and separator line
+#define FOOTER_HEIGHT          32
+#define FOOTER_VERTICAL_MARGIN 7
+#define FOOTER_SIDE_MARGIN     20
+// Native glyph size of pax_font_saira_regular; bitmap fonts blur at other sizes
+#define FOOTER_TEXT_HEIGHT     18
+
+// Draw a launcher-icon-style keycap (dark rounded square with the key label)
+// followed by a description. Returns the total width drawn.
+static float draw_menu_hint(float x, float bar_top, int box_height, const char* key, const char* description) {
+    const pax_font_t* font = pax_font_saira_regular;
+
+    pax_vec2f key_size  = pax_text_size(font, FOOTER_TEXT_HEIGHT, key);
+    float     cap_h     = 26;
+    float     cap_w     = key_size.x + 12;
+    float     cap_y     = bar_top + (box_height - cap_h) / 2;
+
+    pax_draw_round_rect(&fb, FOOTER_COLOR_FG, x, cap_y, cap_w, cap_h, 4);
+    pax_draw_text(&fb, 0xFF101010, font, FOOTER_TEXT_HEIGHT, x + 6,
+                  cap_y + (cap_h - FOOTER_TEXT_HEIGHT) / 2 - 1, key);
+
+    float text_x = x + cap_w + 6;
+    pax_vec2f desc_size = pax_text_size(font, FOOTER_TEXT_HEIGHT, description);
+    pax_draw_text(&fb, FOOTER_COLOR_FG, font, FOOTER_TEXT_HEIGHT, text_x,
+                  bar_top + (box_height - FOOTER_TEXT_HEIGHT) / 2.0f, description);
+
+    return cap_w + 6 + desc_size.x;
+}
+
 static void draw_menu_bar(void) {
     int width      = pax_buf_get_width(&fb);
     int height     = pax_buf_get_height(&fb);
-    int bar_height = 36;
-    int bar_top    = height - bar_height;
+    int box_height = FOOTER_HEIGHT + (FOOTER_VERTICAL_MARGIN * 2);
+    int bar_top    = height - box_height;
 
-    pax_draw_rect(&fb, 0xE0101010, 0, bar_top, width, bar_height);
-    pax_draw_line(&fb, COLOR_WHITE, 0, bar_top, width, bar_top);
-    pax_draw_text(&fb, COLOR_WHITE, pax_font_sky_mono, 16, 10, bar_top + 10,
-                  "ESC/X exit | Left/Right navigate | R random | F flip");
+    // Bar background and separator line, same geometry as the launcher's gui_footer_draw
+    pax_draw_rect(&fb, FOOTER_COLOR_BG, FOOTER_SIDE_MARGIN, bar_top,
+                  width - (FOOTER_SIDE_MARGIN * 2), box_height - FOOTER_VERTICAL_MARGIN);
+    pax_draw_line(&fb, FOOTER_COLOR_FG, FOOTER_SIDE_MARGIN, bar_top,
+                  width - FOOTER_SIDE_MARGIN, bar_top);
+
+    char timer_text[32];
+    snprintf(timer_text, sizeof(timer_text), "Timer: %s", slideshow_labels[slideshow_mode]);
+
+    float x = FOOTER_SIDE_MARGIN + 10;
+    x += draw_menu_hint(x, bar_top, box_height - FOOTER_VERTICAL_MARGIN, "ESC", "Exit") + 20;
+    x += draw_menu_hint(x, bar_top, box_height - FOOTER_VERTICAL_MARGIN, "< >", "Navigate") + 20;
+    x += draw_menu_hint(x, bar_top, box_height - FOOTER_VERTICAL_MARGIN, "R", "Random") + 20;
+    x += draw_menu_hint(x, bar_top, box_height - FOOTER_VERTICAL_MARGIN, "F", "Flip") + 20;
+    x += draw_menu_hint(x, bar_top, box_height - FOOTER_VERTICAL_MARGIN, "T", timer_text);
 }
 
 // Redraw the current frame: the loaded image (or a fallback message),
@@ -272,6 +322,9 @@ static bool load_image(int index) {
     has_current_image  = true;
     current_image_index = index;
 
+    // Any image change (manual or automatic) restarts the slideshow countdown
+    slideshow_last_tick = xTaskGetTickCount();
+
     ESP_LOGI(TAG, "Image loaded successfully: %s", png_files[index]);
     return true;
 }
@@ -344,6 +397,10 @@ static void handle_input_event(bsp_input_event_t* event) {
             } else if (event->args_keyboard.ascii == 'f' || event->args_keyboard.ascii == 'F') {
                 ESP_LOGI(TAG, "F key pressed - flip image");
                 flip_image();
+            } else if (event->args_keyboard.ascii == 't' || event->args_keyboard.ascii == 'T') {
+                slideshow_mode      = (slideshow_mode + 1) % SLIDESHOW_MODE_COUNT;
+                slideshow_last_tick = xTaskGetTickCount();
+                ESP_LOGI(TAG, "T key pressed - slideshow timer: %s", slideshow_labels[slideshow_mode]);
             } else if (event->args_keyboard.ascii == 'x' || event->args_keyboard.ascii == 'X') {
                 ESP_LOGI(TAG, "X key pressed - returning to launcher");
                 bsp_device_restart_to_launcher();
@@ -560,6 +617,14 @@ void app_main(void) {
         } else if (menu_visible &&
                    (xTaskGetTickCount() - menu_shown_tick) >= pdMS_TO_TICKS(MENU_TIMEOUT_MS)) {
             menu_visible = false;
+            render_frame();
+        }
+
+        // Slideshow timer: advance to the next image when the interval elapses
+        if (slideshow_mode > 0 && has_current_image &&
+            (xTaskGetTickCount() - slideshow_last_tick) >=
+                pdMS_TO_TICKS(slideshow_intervals_ms[slideshow_mode])) {
+            next_image();
             render_frame();
         }
     }
