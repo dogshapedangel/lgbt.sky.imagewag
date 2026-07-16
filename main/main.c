@@ -22,6 +22,7 @@
 // Constants
 static char const TAG[] = "main";
 #define SD_MOUNT_POINT "/sd"
+#define IMAGES_DIR SD_MOUNT_POINT "/images"
 #define MAX_PNG_FILES 100
 #define MAX_PATH_LENGTH 512
 #define IMAGE_WIDTH 800
@@ -53,11 +54,11 @@ static bool is_png_file(const char* filename) {
     return (strcasecmp(filename + len - 4, ".png") == 0);
 }
 
-// Function to scan directory for PNG files and populate the global list
+// Function to scan the images directory for PNG files and populate the global list
 static int scan_png_files(void) {
-    DIR* dir = opendir(SD_MOUNT_POINT);
+    DIR* dir = opendir(IMAGES_DIR);
     if (dir == NULL) {
-        ESP_LOGE(TAG, "Failed to open directory %s", SD_MOUNT_POINT);
+        ESP_LOGW(TAG, "Failed to open directory %s (does it exist?)", IMAGES_DIR);
         return 0;
     }
 
@@ -65,7 +66,7 @@ static int scan_png_files(void) {
     int total_files = 0;
     struct dirent* entry;
 
-    ESP_LOGI(TAG, "Scanning directory %s for files:", SD_MOUNT_POINT);
+    ESP_LOGI(TAG, "Scanning directory %s for files:", IMAGES_DIR);
 
     while ((entry = readdir(dir)) != NULL && png_count < MAX_PNG_FILES) {
         if (entry->d_type == DT_REG) {
@@ -73,10 +74,10 @@ static int scan_png_files(void) {
             ESP_LOGI(TAG, "Found file: %s", entry->d_name);
 
             if (is_png_file(entry->d_name)) {
-                size_t path_len = strlen(SD_MOUNT_POINT) + strlen(entry->d_name) + 2;  // +2 for '/' and '\0'
+                size_t path_len = strlen(IMAGES_DIR) + strlen(entry->d_name) + 2;  // +2 for '/' and '\0'
                 if (path_len < MAX_PATH_LENGTH) {
                     snprintf(png_files[png_count], sizeof(png_files[png_count]),
-                             "%s/%s", SD_MOUNT_POINT, entry->d_name);
+                             "%s/%s", IMAGES_DIR, entry->d_name);
                     png_count++;
                     ESP_LOGI(TAG, "  -> This is a PNG file!");
                 } else {
@@ -94,9 +95,9 @@ static int scan_png_files(void) {
 
     if (png_count == 0) {
         if (total_files == 0) {
-            ESP_LOGW(TAG, "No files found in %s", SD_MOUNT_POINT);
+            ESP_LOGW(TAG, "No files found in %s", IMAGES_DIR);
         } else {
-            ESP_LOGW(TAG, "No PNG files found in %s (found %d other files)", SD_MOUNT_POINT, total_files);
+            ESP_LOGW(TAG, "No PNG files found in %s (found %d other files)", IMAGES_DIR, total_files);
         }
     }
 
@@ -175,9 +176,9 @@ static void render_frame(void) {
         pax_draw_image_op(&fb, &current_image, 0, 0);
         blit();
     } else if (!sd_card_available) {
-        draw_message("SD Card Error", "Check GPIO pins", "and reboot device");
+        draw_message("SD Card Error", "Check that an SD card is", "inserted and reboot the device");
     } else {
-        draw_message("No PNG files found", "Check console for", "file listing");
+        draw_message("No images found", "Copy 800x480 PNGs to the images/", "folder on the SD card and restart");
     }
 }
 
