@@ -47,6 +47,11 @@ static pax_buf_t current_image   = {0};
 static bool has_current_image    = false;
 static bool image_flipped        = false;
 
+// Menu bar: shown at startup and on any key press, auto-hides after a timeout
+#define MENU_TIMEOUT_MS 3000
+static bool       menu_visible    = false;
+static TickType_t menu_shown_tick = 0;
+
 // Function to check if a filename ends with .png
 static bool is_png_file(const char* filename) {
     size_t len = strlen(filename);
@@ -166,20 +171,37 @@ static void draw_message(const char* line1, const char* line2, const char* line3
     if (line3) {
         pax_draw_text(&fb, COLOR_WHITE, pax_font_sky_mono, 28, 20, y, line3);
     }
-    blit();
 }
 
-// Redraw the current frame: the loaded image, or a fallback message
+static void draw_menu_bar(void) {
+    int width      = pax_buf_get_width(&fb);
+    int height     = pax_buf_get_height(&fb);
+    int bar_height = 36;
+    int bar_top    = height - bar_height;
+
+    pax_draw_rect(&fb, 0xE0101010, 0, bar_top, width, bar_height);
+    pax_draw_line(&fb, COLOR_WHITE, 0, bar_top, width, bar_top);
+    pax_draw_text(&fb, COLOR_WHITE, pax_font_sky_mono, 16, 10, bar_top + 10,
+                  "ESC/X exit | Left/Right navigate | R random | F flip");
+}
+
+// Redraw the current frame: the loaded image (or a fallback message),
+// plus the menu bar when visible, then push it to the display.
 static void render_frame(void) {
     if (has_current_image) {
         pax_background(&fb, COLOR_BLACK);
         pax_draw_image_op(&fb, &current_image, 0, 0);
-        blit();
     } else if (!sd_card_available) {
         draw_message("SD Card Error", "Check that an SD card is", "inserted and reboot the device");
     } else {
         draw_message("No images found", "Copy 800x480 PNGs to the images/", "folder on the SD card and restart");
     }
+
+    if (menu_visible) {
+        draw_menu_bar();
+    }
+
+    blit();
 }
 
 static void free_current_image(void) {
@@ -250,8 +272,6 @@ static bool load_image(int index) {
     has_current_image  = true;
     current_image_index = index;
 
-    render_frame();
-
     ESP_LOGI(TAG, "Image loaded successfully: %s", png_files[index]);
     return true;
 }
@@ -281,7 +301,6 @@ static void flip_image(void) {
     image_flipped = !image_flipped;
     if (has_current_image) {
         flip_image_pixels_180(&current_image);
-        render_frame();
     }
     ESP_LOGI(TAG, "Image flip is now %s", image_flipped ? "on" : "off");
 }
@@ -332,14 +351,9 @@ static void handle_input_event(bsp_input_event_t* event) {
             break;
 
         case INPUT_EVENT_TYPE_SCANCODE:
-            ESP_LOGI(TAG, "Scancode event: scancode=0x%04x", event->args_scancode.scancode);
-            if (event->args_scancode.scancode == BSP_INPUT_SCANCODE_R) {
-                ESP_LOGI(TAG, "R scancode - random image");
-                random_image();
-            } else if (event->args_scancode.scancode == BSP_INPUT_SCANCODE_F) {
-                ESP_LOGI(TAG, "F scancode - flip image");
-                flip_image();
-            }
+            // Intentionally ignored: every key press already arrives as a KEYBOARD
+            // (ascii) event as well, so acting on scancodes too would double-fire
+            // R/F (flip would toggle twice and cancel itself out).
             break;
 
         default:
@@ -525,9 +539,12 @@ void app_main(void) {
         current_image_index = 0;
         load_image(current_image_index);
         ESP_LOGI(TAG, "Attempted to load first image: %d/%d", current_image_index + 1, png_count);
-    } else {
-        render_frame();
     }
+
+    // Show the menu bar on first start
+    menu_visible    = true;
+    menu_shown_tick = xTaskGetTickCount();
+    render_frame();
 
     ESP_LOGI(TAG, "Starting main event loop");
     ESP_LOGI(TAG, "Controls: Left/Right arrows = navigate, R = random image, F = flip image");
@@ -536,7 +553,14 @@ void app_main(void) {
     bsp_input_event_t input_event;
     while (true) {
         if (xQueueReceive(input_event_queue, &input_event, pdMS_TO_TICKS(100)) == pdTRUE) {
+            menu_visible    = true;
+            menu_shown_tick = xTaskGetTickCount();
             handle_input_event(&input_event);
+            render_frame();
+        } else if (menu_visible &&
+                   (xTaskGetTickCount() - menu_shown_tick) >= pdMS_TO_TICKS(MENU_TIMEOUT_MS)) {
+            menu_visible = false;
+            render_frame();
         }
     }
 }
