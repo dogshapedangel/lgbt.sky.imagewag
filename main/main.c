@@ -3,59 +3,58 @@
 #include <string.h>
 #include <dirent.h>
 #include <time.h>
+#include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "bsp/device.h"
 #include "bsp/display.h"
 #include "bsp/input.h"
-#include "bsp_lvgl.h"
-#include "core/lv_obj.h"
-#include "display/lv_display.h"
+#include "pax_codecs.h"
+#include "pax_fonts.h"
+#include "pax_gfx.h"
 #include "driver/gpio.h"
 #include "driver/sdmmc_host.h"
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
-#include "font/lv_font.h"
-#include "hal/lcd_types.h"
-#include "layouts/flex/lv_flex.h"
 #include "nvs_flash.h"
 #include "sdmmc_cmd.h"
-#include "widgets/label/lv_label.h"
-#include "widgets/textarea/lv_textarea.h"
-#include "widgets/image/lv_image.h"
-#include "misc/cache/lv_image_cache.h"
 
 // Constants
 static char const TAG[] = "main";
 #define SD_MOUNT_POINT "/sd"
 #define MAX_PNG_FILES 100
 #define MAX_PATH_LENGTH 512
+#define IMAGE_WIDTH 800
+#define IMAGE_HEIGHT 480
+#define IMAGE_BYTES_PER_PIXEL 3  // PAX_BUF_24_888RGB
+
+#define COLOR_BLACK 0xFF000000
+#define COLOR_WHITE 0xFFFFFFFF
 
 // Global variables
-static esp_lcd_panel_handle_t       display_lcd_panel    = NULL;
-static esp_lcd_panel_io_handle_t    display_lcd_panel_io = NULL;
-static size_t                       display_h_res        = 0;
-static size_t                       display_v_res        = 0;
-static lcd_color_rgb_pixel_format_t display_color_format;
-static QueueHandle_t                input_event_queue = NULL;
+static size_t         display_h_res = 0;
+static size_t         display_v_res = 0;
+static pax_buf_t      fb            = {0};
+static QueueHandle_t  input_event_queue = NULL;
 
 // Image navigation variables
 static char png_files[MAX_PNG_FILES][MAX_PATH_LENGTH];
-static int png_count = 0;
-static int current_image_index = 0;
-static bool sd_card_available = false;
-static lv_obj_t* current_image = NULL;
-static bool image_flipped = false;
+static int  png_count            = 0;
+static int  current_image_index  = 0;
+static bool sd_card_available    = false;
+static pax_buf_t current_image   = {0};
+static bool has_current_image    = false;
+static bool image_flipped        = false;
 
 // Function to check if a filename ends with .png
-bool is_png_file(const char* filename) {
+static bool is_png_file(const char* filename) {
     size_t len = strlen(filename);
     if (len < 4) return false;
     return (strcasecmp(filename + len - 4, ".png") == 0);
 }
 
 // Function to scan directory for PNG files and populate the global list
-int scan_png_files(void) {
+static int scan_png_files(void) {
     DIR* dir = opendir(SD_MOUNT_POINT);
     if (dir == NULL) {
         ESP_LOGE(TAG, "Failed to open directory %s", SD_MOUNT_POINT);
@@ -68,18 +67,16 @@ int scan_png_files(void) {
 
     ESP_LOGI(TAG, "Scanning directory %s for files:", SD_MOUNT_POINT);
 
-    // Scan directory for PNG files
     while ((entry = readdir(dir)) != NULL && png_count < MAX_PNG_FILES) {
         if (entry->d_type == DT_REG) {
             total_files++;
             ESP_LOGI(TAG, "Found file: %s", entry->d_name);
-            
+
             if (is_png_file(entry->d_name)) {
-                // Check if the full path will fit in the buffer
-                size_t path_len = strlen(SD_MOUNT_POINT) + strlen(entry->d_name) + 2; // +2 for '/' and '\0'
+                size_t path_len = strlen(SD_MOUNT_POINT) + strlen(entry->d_name) + 2;  // +2 for '/' and '\0'
                 if (path_len < MAX_PATH_LENGTH) {
-                    snprintf(png_files[png_count], sizeof(png_files[png_count]), 
-                            "%s/%s", SD_MOUNT_POINT, entry->d_name);
+                    snprintf(png_files[png_count], sizeof(png_files[png_count]),
+                             "%s/%s", SD_MOUNT_POINT, entry->d_name);
                     png_count++;
                     ESP_LOGI(TAG, "  -> This is a PNG file!");
                 } else {
@@ -91,8 +88,6 @@ int scan_png_files(void) {
     closedir(dir);
 
     ESP_LOGI(TAG, "Scan complete. Found %d total files, %d PNG files", total_files, png_count);
-    
-    // Log all found PNG files for debugging
     for (int i = 0; i < png_count; i++) {
         ESP_LOGI(TAG, "PNG file %d: %s", i, png_files[i]);
     }
@@ -108,131 +103,197 @@ int scan_png_files(void) {
     return png_count;
 }
 
-// Function to load and display an image
-void load_image(int index) {
-    if (!sd_card_available) {
-        ESP_LOGE(TAG, "SD card not available");
-        return;
+// Blit the framebuffer to the physical display
+static void blit(void) {
+    esp_err_t res = bsp_display_blit(0, 0, display_h_res, display_v_res, pax_buf_get_pixels(&fb));
+    if (res != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to blit to display: %d", res);
     }
-    
-    if (png_count == 0) {
-        ESP_LOGE(TAG, "No PNG files available");
-        return;
-    }
-    
-    if (index < 0 || index >= png_count) {
-        ESP_LOGE(TAG, "Invalid image index: %d (total: %d)", index, png_count);
-        return;
-    }
-    
-    ESP_LOGI(TAG, "Loading image %d: %s", index, png_files[index]);
-    
-    lvgl_lock();
-    
-    // Clear existing image if it exists
-    if (current_image != NULL) {
-        ESP_LOGI(TAG, "Deleting previous image");
-        lv_obj_delete(current_image);
-        current_image = NULL;
-    }
-    
-    // Create new image widget
-    lv_obj_t* screen = lv_screen_active();
-    if (screen == NULL) {
-        ESP_LOGE(TAG, "Failed to get active screen");
-        lvgl_unlock();
-        return;
-    }
-    
-    current_image = lv_image_create(screen);
-    if (current_image == NULL) {
-        ESP_LOGE(TAG, "Failed to create image widget");
-        lvgl_unlock();
-        return;
-    }
-    
-    ESP_LOGI(TAG, "Created image widget, setting source...");
-    
-    // Set the image source
-    lv_image_set_src(current_image, png_files[index]);
-    
-    // Set full size
-    lv_obj_set_size(current_image, 800, 480);
-    
-    // Center the image
-    lv_obj_align(current_image, LV_ALIGN_CENTER, 0, 0);
-    
-    // Make sure the image is visible
-    lv_obj_set_style_bg_opa(current_image, LV_OPA_TRANSP, LV_PART_MAIN);
-    
-    // Apply flip if needed
-    if (image_flipped) {
-        lv_image_set_rotation(current_image, 1800); // 180 degrees = 1800 tenths of degrees
-        ESP_LOGI(TAG, "Applied flip rotation");
-    }
-    
-    current_image_index = index;
-    
-    lvgl_unlock();
-    
-    ESP_LOGI(TAG, "Image loaded successfully: %s", png_files[index]);
 }
 
-// Function to go to next image
-void next_image(void) {
+// Reverse a decoded image's pixels in place, 180 degrees.
+// Operates directly on the raw pixel bytes rather than a PAX rotation
+// matrix/shader, so there is no interpolation/transform edge case that can
+// leave stray pixels at the buffer boundary.
+static void flip_image_pixels_180(pax_buf_t* buf) {
+    int      w          = pax_buf_get_width(buf);
+    int      h          = pax_buf_get_height(buf);
+    int      row_bytes  = w * IMAGE_BYTES_PER_PIXEL;
+    uint8_t* pixels     = (uint8_t*)pax_buf_get_pixels_rw(buf);
+
+    uint8_t* tmp_row = malloc(row_bytes);
+    if (tmp_row == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate row buffer for flip");
+        return;
+    }
+
+    // Swap row i with row (h-1-i)
+    for (int y = 0; y < h / 2; y++) {
+        uint8_t* top_row    = pixels + (size_t)y * row_bytes;
+        uint8_t* bottom_row = pixels + (size_t)(h - 1 - y) * row_bytes;
+        memcpy(tmp_row, top_row, row_bytes);
+        memcpy(top_row, bottom_row, row_bytes);
+        memcpy(bottom_row, tmp_row, row_bytes);
+    }
+    free(tmp_row);
+
+    // Reverse pixel order within every row
+    for (int y = 0; y < h; y++) {
+        uint8_t* row = pixels + (size_t)y * row_bytes;
+        for (int x = 0; x < w / 2; x++) {
+            uint8_t* left  = row + (size_t)x * IMAGE_BYTES_PER_PIXEL;
+            uint8_t* right = row + (size_t)(w - 1 - x) * IMAGE_BYTES_PER_PIXEL;
+            uint8_t  tmp[IMAGE_BYTES_PER_PIXEL];
+            memcpy(tmp, left, IMAGE_BYTES_PER_PIXEL);
+            memcpy(left, right, IMAGE_BYTES_PER_PIXEL);
+            memcpy(right, tmp, IMAGE_BYTES_PER_PIXEL);
+        }
+    }
+}
+
+static void draw_message(const char* line1, const char* line2, const char* line3) {
+    pax_background(&fb, COLOR_BLACK);
+    int y = 200;
+    if (line1) {
+        pax_draw_text(&fb, COLOR_WHITE, pax_font_sky_mono, 28, 20, y, line1);
+        y += 34;
+    }
+    if (line2) {
+        pax_draw_text(&fb, COLOR_WHITE, pax_font_sky_mono, 28, 20, y, line2);
+        y += 34;
+    }
+    if (line3) {
+        pax_draw_text(&fb, COLOR_WHITE, pax_font_sky_mono, 28, 20, y, line3);
+    }
+    blit();
+}
+
+// Redraw the current frame: the loaded image, or a fallback message
+static void render_frame(void) {
+    if (has_current_image) {
+        pax_background(&fb, COLOR_BLACK);
+        pax_draw_image_op(&fb, &current_image, 0, 0);
+        blit();
+    } else if (!sd_card_available) {
+        draw_message("SD Card Error", "Check GPIO pins", "and reboot device");
+    } else {
+        draw_message("No PNG files found", "Check console for", "file listing");
+    }
+}
+
+static void free_current_image(void) {
+    if (has_current_image) {
+        pax_buf_destroy(&current_image);
+        has_current_image = false;
+    }
+}
+
+// Decode and display the PNG at the given index. Returns false (and leaves
+// the previously displayed image, if any, untouched) on any failure.
+static bool load_image(int index) {
+    if (!sd_card_available) {
+        ESP_LOGE(TAG, "SD card not available");
+        return false;
+    }
+    if (png_count == 0) {
+        ESP_LOGE(TAG, "No PNG files available");
+        return false;
+    }
+    if (index < 0 || index >= png_count) {
+        ESP_LOGE(TAG, "Invalid image index: %d (total: %d)", index, png_count);
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Loading image %d: %s", index, png_files[index]);
+
+    FILE* fd = fopen(png_files[index], "rb");
+    if (fd == NULL) {
+        ESP_LOGE(TAG, "Failed to open %s", png_files[index]);
+        return false;
+    }
+
+    pax_png_info_t info;
+    if (!pax_info_png_fd(&info, fd)) {
+        ESP_LOGE(TAG, "Failed to read PNG info for %s", png_files[index]);
+        fclose(fd);
+        return false;
+    }
+    if (info.width != IMAGE_WIDTH || info.height != IMAGE_HEIGHT) {
+        ESP_LOGW(TAG, "Skipping %s: expected %dx%d, got %" PRIu32 "x%" PRIu32,
+                 png_files[index], IMAGE_WIDTH, IMAGE_HEIGHT, info.width, info.height);
+        fclose(fd);
+        return false;
+    }
+
+    rewind(fd);
+    pax_buf_t new_image;
+    bool      decoded = pax_decode_png_fd(&new_image, fd, PAX_BUF_24_888RGB, CODEC_FLAG_STRICT);
+    fclose(fd);
+
+    if (!decoded) {
+        ESP_LOGE(TAG, "Failed to decode %s", png_files[index]);
+        return false;
+    }
+    if (pax_buf_get_type(&new_image) != PAX_BUF_24_888RGB) {
+        ESP_LOGE(TAG, "Decoded %s in unexpected pixel format, skipping", png_files[index]);
+        pax_buf_destroy(&new_image);
+        return false;
+    }
+
+    if (image_flipped) {
+        flip_image_pixels_180(&new_image);
+    }
+
+    free_current_image();
+    current_image      = new_image;
+    has_current_image  = true;
+    current_image_index = index;
+
+    render_frame();
+
+    ESP_LOGI(TAG, "Image loaded successfully: %s", png_files[index]);
+    return true;
+}
+
+static void next_image(void) {
     if (png_count == 0) return;
-    
     int next_index = (current_image_index + 1) % png_count;
     load_image(next_index);
     ESP_LOGI(TAG, "Switched to next image: %d/%d", next_index + 1, png_count);
 }
 
-// Function to go to previous image
-void previous_image(void) {
+static void previous_image(void) {
     if (png_count == 0) return;
-    
     int prev_index = (current_image_index - 1 + png_count) % png_count;
     load_image(prev_index);
     ESP_LOGI(TAG, "Switched to previous image: %d/%d", prev_index + 1, png_count);
 }
 
-// Function to go to random image
-void random_image(void) {
+static void random_image(void) {
     if (png_count == 0) return;
-    
-    srand(time(NULL));
     int random_index = rand() % png_count;
     load_image(random_index);
     ESP_LOGI(TAG, "Switched to random image: %d/%d", random_index + 1, png_count);
 }
 
-// Function to flip image upside down
-void flip_image(void) {
-    if (current_image == NULL) return;
-    
-    lvgl_lock();
-    
+static void flip_image(void) {
     image_flipped = !image_flipped;
-    
-    if (image_flipped) {
-        lv_image_set_rotation(current_image, 1800); // 180 degrees
-        ESP_LOGI(TAG, "Image flipped upside down");
-    } else {
-        lv_image_set_rotation(current_image, 0); // 0 degrees
-        ESP_LOGI(TAG, "Image flipped back to normal");
+    if (has_current_image) {
+        flip_image_pixels_180(&current_image);
+        render_frame();
     }
-    
-    lvgl_unlock();
+    ESP_LOGI(TAG, "Image flip is now %s", image_flipped ? "on" : "off");
 }
 
 // Function to handle input events
-void handle_input_event(bsp_input_event_t* event) {
+static void handle_input_event(bsp_input_event_t* event) {
     ESP_LOGI(TAG, "Input event received: type=%d", event->type);
-    
+
     switch (event->type) {
         case INPUT_EVENT_TYPE_NAVIGATION:
-            ESP_LOGI(TAG, "Navigation event: key=%d, state=%d", event->args_navigation.key, event->args_navigation.state);
-            if (event->args_navigation.state) { // Key press (not release)
+            ESP_LOGI(TAG, "Navigation event: key=%d, state=%d", event->args_navigation.key,
+                     event->args_navigation.state);
+            if (event->args_navigation.state) {  // Key press (not release)
                 switch (event->args_navigation.key) {
                     case BSP_INPUT_NAVIGATION_KEY_LEFT:
                         ESP_LOGI(TAG, "Left arrow pressed");
@@ -242,28 +303,35 @@ void handle_input_event(bsp_input_event_t* event) {
                         ESP_LOGI(TAG, "Right arrow pressed");
                         next_image();
                         break;
+                    case BSP_INPUT_NAVIGATION_KEY_ESC:
+                    case BSP_INPUT_NAVIGATION_KEY_F1:
+                        ESP_LOGI(TAG, "Exit key pressed - returning to launcher");
+                        bsp_device_restart_to_launcher();
+                        break;
                     default:
                         ESP_LOGI(TAG, "Other navigation key: %d", event->args_navigation.key);
                         break;
                 }
             }
             break;
-            
+
         case INPUT_EVENT_TYPE_KEYBOARD:
-            ESP_LOGI(TAG, "Keyboard event: ascii='%c' (0x%02x)", event->args_keyboard.ascii, event->args_keyboard.ascii);
-            // Handle ASCII keyboard input
+            ESP_LOGI(TAG, "Keyboard event: ascii='%c' (0x%02x)", event->args_keyboard.ascii,
+                     event->args_keyboard.ascii);
             if (event->args_keyboard.ascii == 'r' || event->args_keyboard.ascii == 'R') {
                 ESP_LOGI(TAG, "R key pressed - random image");
                 random_image();
             } else if (event->args_keyboard.ascii == 'f' || event->args_keyboard.ascii == 'F') {
                 ESP_LOGI(TAG, "F key pressed - flip image");
                 flip_image();
+            } else if (event->args_keyboard.ascii == 'x' || event->args_keyboard.ascii == 'X') {
+                ESP_LOGI(TAG, "X key pressed - returning to launcher");
+                bsp_device_restart_to_launcher();
             }
             break;
-            
+
         case INPUT_EVENT_TYPE_SCANCODE:
             ESP_LOGI(TAG, "Scancode event: scancode=0x%04x", event->args_scancode.scancode);
-            // Handle scancode input for R and F keys
             if (event->args_scancode.scancode == BSP_INPUT_SCANCODE_R) {
                 ESP_LOGI(TAG, "R scancode - random image");
                 random_image();
@@ -272,7 +340,7 @@ void handle_input_event(bsp_input_event_t* event) {
                 flip_image();
             }
             break;
-            
+
         default:
             ESP_LOGI(TAG, "Unknown input event type: %d", event->type);
             break;
@@ -292,24 +360,33 @@ void app_main(void) {
     ESP_ERROR_CHECK(res);
 
     // Initialize the Board Support Package
-    ESP_ERROR_CHECK(bsp_device_initialize());
+    const bsp_configuration_t bsp_configuration = {
+        .display =
+            {
+                .requested_color_format = BSP_DISPLAY_COLOR_FORMAT_24_888RGB,
+                .num_fbs                = 1,
+            },
+    };
+    ESP_ERROR_CHECK(bsp_device_initialize(&bsp_configuration));
 
     // Set log level to maximum verbosity to see all debug messages
     esp_log_level_set("*", ESP_LOG_VERBOSE);
 
+    srand(time(NULL));
+
     // Mount SD card with proper GPIO configuration for Tanmatsu
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = false,
-        .max_files = 5,
-        .allocation_unit_size = 16 * 1024
+        .max_files              = 5,
+        .allocation_unit_size   = 16 * 1024
     };
-    
+
     sdmmc_card_t* card;
-    const char mount_point[] = SD_MOUNT_POINT;
+    const char    mount_point[] = SD_MOUNT_POINT;
     ESP_LOGI(TAG, "Initializing SD card");
-    
+
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-    
+
     // Use the same GPIO configuration as Tanmatsu launcher
     sdmmc_slot_config_t slot_config = {
         .clk   = GPIO_NUM_43,
@@ -327,16 +404,16 @@ void app_main(void) {
         .width = 4,
         .flags = 0,
     };
-    
+
     esp_err_t sd_ret = esp_vfs_fat_sdmmc_mount(mount_point, &host, &slot_config, &mount_config, &card);
     sd_card_available = false;
-    
+
     if (sd_ret != ESP_OK) {
         ESP_LOGW(TAG, "SDMMC mount failed (%s), trying SPI mode...", esp_err_to_name(sd_ret));
-        
+
         // Try SPI mode as fallback (like Tanmatsu launcher)
         sdmmc_host_t spi_host = SDSPI_HOST_DEFAULT();
-        
+
         spi_bus_config_t bus_cfg = {
             .mosi_io_num     = GPIO_NUM_44,
             .miso_io_num     = GPIO_NUM_39,
@@ -358,12 +435,13 @@ void app_main(void) {
             sd_ret = esp_vfs_fat_sdspi_mount(mount_point, &spi_host, &spi_slot_config, &mount_config, &card);
         }
     }
-    
+
     if (sd_ret != ESP_OK) {
         if (sd_ret == ESP_FAIL) {
             ESP_LOGE(TAG, "Failed to mount SD card filesystem.");
         } else {
-            ESP_LOGE(TAG, "Failed to initialize the SD card (%s). Make sure SD card is inserted.", esp_err_to_name(sd_ret));
+            ESP_LOGE(TAG, "Failed to initialize the SD card (%s). Make sure SD card is inserted.",
+                     esp_err_to_name(sd_ret));
         }
         ESP_LOGW(TAG, "Continuing without SD card - will show fallback message");
         sd_card_available = false;
@@ -373,23 +451,62 @@ void app_main(void) {
         sd_card_available = true;
     }
 
-    // Fetch the handle for using the screen, this works even when
-    res = bsp_display_get_panel(&display_lcd_panel);
-    ESP_ERROR_CHECK(res);                             // Check that the display handle has been initialized
-    bsp_display_get_panel_io(&display_lcd_panel_io);  // Do not check result of panel IO handle: not all types of
-                                                      // display expose a panel IO handle
-    res = bsp_display_get_parameters(&display_h_res, &display_v_res, &display_color_format);
-    ESP_ERROR_CHECK(res);  // Check that the display parameters have been initialized
+    // Get display parameters and rotation
+    size_t                       h_res  = 0;
+    size_t                       v_res  = 0;
+    bsp_display_color_format_t   color_format = 0;
+    bsp_display_endianness_t     data_endian  = 0;
+    res = bsp_display_get_parameters(&h_res, &v_res, &color_format, &data_endian);
+    ESP_ERROR_CHECK(res);
+    display_h_res = h_res;
+    display_v_res = v_res;
+
+    // Convert ESP-IDF color format into PAX buffer type
+    pax_buf_type_t format = PAX_BUF_24_888RGB;
+    switch (color_format) {
+        case BSP_DISPLAY_COLOR_FORMAT_1_PAL:      format = PAX_BUF_1_PAL;      break;
+        case BSP_DISPLAY_COLOR_FORMAT_2_PAL:      format = PAX_BUF_2_PAL;      break;
+        case BSP_DISPLAY_COLOR_FORMAT_4_PAL:      format = PAX_BUF_4_PAL;      break;
+        case BSP_DISPLAY_COLOR_FORMAT_8_PAL:      format = PAX_BUF_8_PAL;      break;
+        case BSP_DISPLAY_COLOR_FORMAT_16_PAL:     format = PAX_BUF_16_PAL;     break;
+        case BSP_DISPLAY_COLOR_FORMAT_1_GREY:     format = PAX_BUF_1_GREY;     break;
+        case BSP_DISPLAY_COLOR_FORMAT_2_GREY:     format = PAX_BUF_2_GREY;     break;
+        case BSP_DISPLAY_COLOR_FORMAT_4_GREY:     format = PAX_BUF_4_GREY;     break;
+        case BSP_DISPLAY_COLOR_FORMAT_8_GREY:     format = PAX_BUF_8_GREY;     break;
+        case BSP_DISPLAY_COLOR_FORMAT_8_332RGB:   format = PAX_BUF_8_332RGB;   break;
+        case BSP_DISPLAY_COLOR_FORMAT_16_565RGB:  format = PAX_BUF_16_565RGB;  break;
+        case BSP_DISPLAY_COLOR_FORMAT_4_1111ARGB: format = PAX_BUF_4_1111ARGB; break;
+        case BSP_DISPLAY_COLOR_FORMAT_8_2222ARGB: format = PAX_BUF_8_2222ARGB; break;
+        case BSP_DISPLAY_COLOR_FORMAT_16_4444ARGB:format = PAX_BUF_16_4444ARGB;break;
+        case BSP_DISPLAY_COLOR_FORMAT_24_888RGB:  format = PAX_BUF_24_888RGB;  break;
+        case BSP_DISPLAY_COLOR_FORMAT_32_8888ARGB:format = PAX_BUF_32_8888ARGB;break;
+        default:
+            ESP_LOGW(TAG, "BSP requests color format not supported by PAX (%u), defaulting to 24_888RGB",
+                      color_format);
+            break;
+    }
+
+    if (format != PAX_BUF_24_888RGB) {
+        ESP_LOGE(TAG, "Display did not provide the requested 24_888RGB format (got %d) - image drawing assumes "
+                       "24-bit RGB and will not work correctly", format);
+    }
+
+    bsp_display_rotation_t display_rotation = bsp_display_get_default_rotation();
+    pax_orientation_t      orientation      = PAX_O_UPRIGHT;
+    switch (display_rotation) {
+        case BSP_DISPLAY_ROTATION_90:  orientation = PAX_O_ROT_CCW;  break;
+        case BSP_DISPLAY_ROTATION_180: orientation = PAX_O_ROT_HALF; break;
+        case BSP_DISPLAY_ROTATION_270: orientation = PAX_O_ROT_CW;   break;
+        case BSP_DISPLAY_ROTATION_0:
+        default:                       orientation = PAX_O_UPRIGHT;  break;
+    }
+
+    // Initialize graphics stack
+    pax_buf_init(&fb, NULL, display_h_res, display_v_res, format);
+    pax_buf_reversed(&fb, data_endian == BSP_DISPLAY_ENDIAN_BIG);
+    pax_buf_set_orientation(&fb, orientation);
 
     ESP_ERROR_CHECK(bsp_input_get_queue(&input_event_queue));
-
-    // Initialise LVGL
-    lvgl_init(display_h_res, display_v_res, display_color_format, display_lcd_panel, display_lcd_panel_io,
-              input_event_queue);
-
-    // Increase LVGL image cache size to handle larger images (2MB)
-    lv_image_cache_resize(2 * 1024 * 1024, true);
-    ESP_LOGI(TAG, "LVGL image cache resized to 2MB");
 
     ESP_LOGW(TAG, "Hello world!");
 
@@ -402,37 +519,13 @@ void app_main(void) {
         ESP_LOGW(TAG, "SD card not available, skipping PNG file scanning");
     }
 
-    lvgl_lock();
-
-    lv_obj_t* screen = lv_screen_active();
-    
-    // Set a purple background color to verify screen is working
-    lv_obj_set_style_bg_color(screen, lv_color_hex(0x8B00FF), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
-    
     if (png_count > 0) {
         ESP_LOGI(TAG, "PNG files found, attempting to load first image...");
-        lvgl_unlock(); // Unlock before calling load_image which has its own lock
-        
-        // Load the first image
         current_image_index = 0;
         load_image(current_image_index);
         ESP_LOGI(TAG, "Attempted to load first image: %d/%d", current_image_index + 1, png_count);
     } else {
-        // Fallback: show a label if no PNG files found or SD card not available
-        lv_obj_t* label = lv_label_create(screen);
-        lv_obj_set_style_text_font(label, &lv_font_montserrat_42, LV_STATE_DEFAULT);
-        
-        if (!sd_card_available) {
-            lv_label_set_text(label, "SD Card Error\nCheck GPIO pins\nand reboot device");
-            ESP_LOGW(TAG, "SD card not available, showing error message");
-        } else {
-            lv_label_set_text(label, "No PNG files found\nCheck console for\nfile listing");
-            ESP_LOGW(TAG, "No PNG files found, showing fallback message. Check logs for file listing.");
-        }
-        lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
-        
-        lvgl_unlock();
+        render_frame();
     }
 
     ESP_LOGI(TAG, "Starting main event loop");
@@ -441,12 +534,8 @@ void app_main(void) {
     // Main event loop
     bsp_input_event_t input_event;
     while (true) {
-        // Check for input events with a timeout
         if (xQueueReceive(input_event_queue, &input_event, pdMS_TO_TICKS(100)) == pdTRUE) {
             handle_input_event(&input_event);
         }
-        
-        // Small delay to prevent excessive CPU usage
-        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
